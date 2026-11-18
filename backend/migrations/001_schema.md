@@ -1,0 +1,2 @@
+# Schema v1
+SQLAlchemy metadata creates users, audits, workloads, candidates, experiments and telemetry on first startup. Workload/candidate natural names are UNIQUE; experiment snapshots are immutable JSON. Foreign keys prevent orphan references. Index trials affect only the dedicated telemetry table, under MySQL GET_LOCK, and drop the trial index after each execution. No production database connection is accepted.

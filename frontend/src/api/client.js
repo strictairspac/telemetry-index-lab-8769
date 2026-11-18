@@ -1,0 +1,4 @@
+export const session={get token(){return sessionStorage.getItem('token')},set token(t){t?sessionStorage.setItem('token',t):sessionStorage.removeItem('token')}};
+export async function api(path,options={}) {let r=await fetch('/api'+path,{...options,headers:{'Content-Type':'application/json',...(session.token?{Authorization:'Bearer '+session.token}:{}),...options.headers}});let data=await r.json();if(!r.ok)throw new Error(typeof data.detail==='string'?data.detail:JSON.stringify(data.detail));return data;}
+export const post=(p,data,method='POST')=>api(p,{method,body:JSON.stringify(data)});
+export async function download(id){let r=await fetch('/api/experiments/'+id+'/export',{headers:{Authorization:'Bearer '+session.token}});if(!r.ok)throw new Error('导出失败，请重试');let a=document.createElement('a');a.href=URL.createObjectURL(await r.blob());a.download='trial-'+id+'.json';a.click();URL.revokeObjectURL(a.href);}
