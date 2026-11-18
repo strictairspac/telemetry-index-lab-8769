@@ -149,8 +149,7 @@ class ReadReplica:
         self.path = path
         _initialize_database(path, _DDL_REPLICA)
         self._applier_conn = _connect_writable(path)
-        self._applier_conn.execute("PRAGMA query_only=ON")
-        self.read_conn = self._applier_conn
+        self.read_conn = _connect_readonly(path)
         self._lock = threading.RLock()
 
     @property
@@ -171,7 +170,7 @@ class ReadReplica:
             return _row_to_dict(cur.fetchone())
 
     def close(self) -> None:
-        self.read_conn.close()
+        self._applier_conn.close()
 
 
 def _row_to_dict(row: tuple | None) -> dict[str, Any] | None:
@@ -248,7 +247,6 @@ class ReplicatedStore:
         if not rows:
             return False
         with self.replica._lock:  # noqa: SLF001
-            conn.execute("PRAGMA query_only=OFF")
             conn.execute("BEGIN IMMEDIATE")
             try:
                 for seq, payload in rows:
@@ -268,7 +266,7 @@ class ReplicatedStore:
                 conn.execute("ROLLBACK")
                 raise
             finally:
-                conn.execute("PRAGMA query_only=ON")
+                pass
         return True
 
     # ---------- 委托给主库的写接口 ----------
