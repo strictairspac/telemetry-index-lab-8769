@@ -49,16 +49,24 @@ INSERT OR IGNORE INTO replica_status (id, applied_seq) VALUES (1, 0);
 
 def _connect_writable(path: str) -> sqlite3.Connection:
     conn = sqlite3.connect(path, check_same_thread=False, isolation_level=None)
-    conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=FULL")
     return conn
 
 
+def _initialize_database(path: str, ddl: str) -> None:
+    conn = sqlite3.connect(path)
+    try:
+        conn.executescript(ddl)
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def _connect_readonly(path: str) -> sqlite3.Connection:
-    # uri 只读模式：副本对应用侧强制只读（类比 MySQL 只读实例）
-    return sqlite3.connect(
-        f"file:{path}?mode=ro", uri=True, check_same_thread=False
-    )
+    # query_only 保留 WAL 读能力，同时禁止应用侧写入副本。
+    conn = sqlite3.connect(path, check_same_thread=False, isolation_level=None)
+    conn.execute("PRAGMA query_only=ON")
+    return conn
 
 
 class PrimaryStore:
@@ -67,8 +75,8 @@ class PrimaryStore:
     def __init__(self, path: str):
         self.path = path
         self._lock = threading.RLock()
+        _initialize_database(path, _DDL_PRIMARY)
         self.conn = _connect_writable(path)
-        self.conn.executescript(_DDL_PRIMARY)
 
     def max_seq(self) -> int:
         row = self.conn.execute("SELECT COALESCE(MAX(seq), 0) FROM replication_log").fetchone()
@@ -135,32 +143,35 @@ class PrimaryStore:
 
 
 class ReadReplica:
-    """只读副本：独立数据文件，应用侧只读，数据只由 applier 回放写入。"""
+    """只读副本：应用侧通过 query_only 读取，只有 applier 临时解除后回放。"""
 
     def __init__(self, path: str):
         self.path = path
+        _initialize_database(path, _DDL_REPLICA)
         self._applier_conn = _connect_writable(path)
-        self._applier_conn.executescript(_DDL_REPLICA)
-        self.read_conn = _connect_readonly(path)
+        self._applier_conn.execute("PRAGMA query_only=ON")
+        self.read_conn = self._applier_conn
+        self._lock = threading.RLock()
 
     @property
     def applied_seq(self) -> int:
-        row = self.read_conn.execute(
-            "SELECT applied_seq FROM replica_status WHERE id=1"
-        ).fetchone()
-        return int(row[0])
+        with self._lock:
+            row = self.read_conn.execute(
+                "SELECT applied_seq FROM replica_status WHERE id=1"
+            ).fetchone()
+            return int(row[0])
 
     def read_row(self, device_id: str, metric: str) -> dict[str, Any] | None:
-        cur = self.read_conn.execute(
-            "SELECT device_id, metric, value, recorded_at, version "
-            "FROM telemetry WHERE device_id=? AND metric=?",
-            (device_id, metric),
-        )
-        return _row_to_dict(cur.fetchone())
+        with self._lock:
+            cur = self.read_conn.execute(
+                "SELECT device_id, metric, value, recorded_at, version "
+                "FROM telemetry WHERE device_id=? AND metric=?",
+                (device_id, metric),
+            )
+            return _row_to_dict(cur.fetchone())
 
     def close(self) -> None:
         self.read_conn.close()
-        self._applier_conn.close()
 
 
 def _row_to_dict(row: tuple | None) -> dict[str, Any] | None:
@@ -236,32 +247,28 @@ class ReplicatedStore:
         ).fetchall()
         if not rows:
             return False
-        conn.execute("BEGIN IMMEDIATE")
-        try:
-            for seq, payload in rows:
-                event = json.loads(payload)
-                conn.execute(
-                    """INSERT INTO telemetry (device_id, metric, value, recorded_at, version)
-                       VALUES (?, ?, ?, ?, ?)
-                    ON CONFLICT(device_id, metric) DO UPDATE SET
-                       value=excluded.value,
-                       recorded_at=excluded.recorded_at,
-                       version=excluded.version""",
-                    (
-                        event["device_id"],
-                        event["metric"],
-                        event["value"],
-                        event["recorded_at"],
-                        event["version"],
-                    ),
-                )
-                conn.execute(
-                    "UPDATE replica_status SET applied_seq=? WHERE id=1", (int(seq),)
-                )
-            conn.execute("COMMIT")
-        except Exception:
-            conn.execute("ROLLBACK")
-            raise
+        with self.replica._lock:  # noqa: SLF001
+            conn.execute("PRAGMA query_only=OFF")
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                for seq, payload in rows:
+                    event = json.loads(payload)
+                    conn.execute(
+                        """INSERT INTO telemetry (device_id, metric, value, recorded_at, version)
+                           VALUES (?, ?, ?, ?, ?)
+                        ON CONFLICT(device_id, metric) DO UPDATE SET
+                           value=excluded.value,
+                           recorded_at=excluded.recorded_at,
+                           version=excluded.version""",
+                        (event["device_id"], event["metric"], event["value"], event["recorded_at"], event["version"]),
+                    )
+                    conn.execute("UPDATE replica_status SET applied_seq=? WHERE id=1", (int(seq),))
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+            finally:
+                conn.execute("PRAGMA query_only=ON")
         return True
 
     # ---------- 委托给主库的写接口 ----------
